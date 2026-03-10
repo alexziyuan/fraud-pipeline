@@ -1,0 +1,14 @@
+# Data files - too large for Git
+data/
+logs/
+
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pkl
+
+# Docker
+*.log
