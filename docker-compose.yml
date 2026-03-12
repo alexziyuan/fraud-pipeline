@@ -65,5 +65,21 @@ services:
     command: scheduler
     restart: always
 
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/models:/app/models # same models folder Airflow writes to
+    environment:
+      DB_CONN: postgresql+psycopg2://fraud_user:fraud_pass@postgres/fraud_db
+      MODEL_DIR: /app/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: always
+
 volumes:
   postgres_data:

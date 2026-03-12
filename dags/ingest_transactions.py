@@ -51,9 +51,8 @@ def ingest_transactions(**context):
     validate_schema(first_chunk)
 
     # Truncate table before full reload (idempotent)
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         conn.execute(sqlalchemy.text("TRUNCATE TABLE transactions_raw"))
-        conn.commit()
 
     # Load in chunks
     for chunk in pd.read_csv(DATA_PATH, chunksize=CHUNK_SIZE):
@@ -75,14 +74,13 @@ def ingest_transactions(**context):
         logging.info(f"Loaded {total_rows} rows so far...")
 
     # Write audit log
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         conn.execute(sqlalchemy.text("""
             INSERT INTO ingestion_log (run_id, rows_loaded, source_file, status, started_at)
             VALUES (:run_id, :rows, :source, 'success', :started)
         """), {"run_id": run_id, "rows": total_rows,
                "source": DATA_PATH, "started": started_at})
-        conn.commit()
-
+        
     logging.info(f"Ingestion complete. Total rows loaded: {total_rows}")
     return total_rows
 

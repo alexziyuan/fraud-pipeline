@@ -29,19 +29,28 @@ FEATURE_COLS = [
 TARGET_COL = 'is_fraud'
 
 
-def load_features(**context) -> dict:
-    """Pull feature view from Postgres into a dataframe, push to XCom."""
+def load_features(**context):
     engine = sqlalchemy.create_engine(DB_CONN)
-    logging.info("Loading features from v_features view...")
+    logging.info("Loading sampled features...")
+    os.makedirs(MODEL_DIR, exist_ok=True)
 
-    df = pd.read_sql("SELECT * FROM v_features", engine)
-    logging.info(f"Loaded {len(df)} rows. Fraud rate: {df[TARGET_COL].mean():.4f}")
+    query = """
+        SELECT * FROM v_features WHERE is_fraud = 1
+        UNION ALL
+        SELECT * FROM (
+            SELECT * FROM v_features
+            WHERE is_fraud = 0
+            ORDER BY RANDOM()
+            LIMIT 200000
+        ) non_fraud
+    """
 
-    # Push to XCom as JSON (Airflow's way of passing data between tasks)
-    context['ti'].xcom_push(key='feature_shape', value=df.shape)
-    context['ti'].xcom_push(key='fraud_rate', value=float(df[TARGET_COL].mean()))
+    df = pd.read_sql(query, engine)
+    logging.info(f"Loaded {len(df)} rows. Fraud rate: {df['is_fraud'].mean():.4f}")
 
-    # Save to disk (XCom isn't suited for large dataframes)
+    context['ti'].xcom_push(key='feature_shape', value=list(df.shape))
+    context['ti'].xcom_push(key='fraud_rate', value=float(df['is_fraud'].mean()))
+
     df.to_parquet(f'{MODEL_DIR}/features.parquet', index=False)
     return {'rows': len(df)}
 
@@ -110,7 +119,7 @@ def train_model(**context):
     fraud_rate = context['ti'].xcom_pull(key='fraud_rate', task_ids='load_features')
     training_rows = context['ti'].xcom_pull(key='feature_shape', task_ids='load_features')[0]
 
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         conn.execute(sqlalchemy.text("""
             INSERT INTO model_runs
                 (run_id, model_version, training_rows, fraud_rate,
@@ -129,7 +138,6 @@ def train_model(**context):
             'f1':         metrics['f1'],
             'path':       model_path,
         })
-        conn.commit()
 
     logging.info("Metrics logged to model_runs table.")
 
