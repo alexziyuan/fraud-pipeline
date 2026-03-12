@@ -1,0 +1,116 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime, timedelta
+import sqlalchemy
+import glob
+import pickle
+import os
+import logging
+import pandas as pd
+
+default_args = {
+    'owner': 'airflow',
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
+
+DB_CONN = "postgresql+psycopg2://fraud_user:fraud_pass@postgres/fraud_db"
+MODEL_DIR = "/opt/airflow/data/models"
+CHUNK_SIZE = 50000
+
+def load_latest_model():
+    files = sorted(glob.glob(os.path.join(MODEL_DIR, "xgb_*.pkl")))
+    if not files:
+        raise FileNotFoundError("No model files found")
+    with open(files[-1], "rb") as f:
+        return pickle.load(f), os.path.basename(files[-1])
+
+  
+def ensure_predictions_table(engine):
+    with engine.begin() as conn:
+        conn.execute(sqlalchemy.text("""
+            CREATE TABLE IF NOT EXISTS predictions (
+                id                SERIAL PRIMARY KEY,
+                type              VARCHAR(20),
+                amount            NUMERIC(18,2),
+                old_balance_orig  NUMERIC(18,2),
+                new_balance_orig  NUMERIC(18,2),
+                old_balance_dest  NUMERIC(18,2),
+                new_balance_dest  NUMERIC(18,2),
+                fraud_probability NUMERIC(6,4),
+                is_fraud          BOOLEAN,
+                model_version     VARCHAR(50),
+                scored_at         TIMESTAMP DEFAULT NOW()
+            )
+        """))
+
+
+def batch_score(**context):
+    engine = sqlalchemy.create_engine(DB_CONN)
+    bundle, model_file = load_latest_model()
+    model = bundle["model"]
+    encoder = bundle["encoder"]
+    features = bundle["features"]
+    version = model_file.replace("xgb_", "").replace(".pkl", "")
+
+    ensure_predictions_table(engine)
+
+    # Clear previous batch predictions to stay idempotent
+    with engine.begin() as conn:
+        conn.execute(sqlalchemy.text("TRUNCATE TABLE predictions"))
+
+    query = """
+        SELECT type, amount,
+               old_balance_orig, new_balance_orig,
+               old_balance_dest, new_balance_dest
+        FROM transactions_raw
+        WHERE type IN ('TRANSFER', 'CASH_OUT')
+        LIMIT 200000
+    """
+
+    total = 0
+    for chunk in pd.read_sql(query, engine, chunksize=CHUNK_SIZE):
+        # Feature engineering mirrors v_features SQL view
+        chunk["type"]              = encoder.transform(chunk["type"])
+        chunk["balance_diff_orig"] = chunk["old_balance_orig"] - chunk["new_balance_orig"]
+        chunk["balance_diff_dest"] = chunk["new_balance_dest"] - chunk["old_balance_dest"]
+        chunk["orig_zero_start"]   = (chunk["old_balance_orig"] == 0).astype(int)
+        chunk["orig_zero_end"]     = (chunk["new_balance_orig"] == 0).astype(int)
+        chunk["is_high_amount"]    = 0
+        chunk["account_tx_count"]  = 1
+        chunk["account_cashout_count"] = 0
+
+        X     = chunk[features]
+        proba = model.predict_proba(X)[:, 1]
+
+        chunk["fraud_probability"] = proba.round(4)
+        chunk["is_fraud"]          = proba >= 0.5
+        chunk["model_version"]     = version
+
+        chunk[[
+            "type", "amount",
+            "old_balance_orig", "new_balance_orig",
+            "old_balance_dest", "new_balance_dest",
+            "fraud_probability", "is_fraud", "model_version"
+        ]].to_sql("predictions", engine, if_exists="append", index=False)
+
+        total += len(chunk)
+        logging.info(f"Scored {total} transactions...")
+
+    logging.info(f"Batch scoring complete. Total: {total}")
+    return total
+
+with DAG(
+    dag_id='batch_score_transactions',
+    default_args=default_args,
+    description='Batch score transactions using latest model',
+    schedule_interval='@daily',
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+    tags=['scoring', 'fraud'],
+) as dag:
+    
+    score_task = PythonOperator(
+        task_id='batch_score',
+        python_callable=batch_score,
+    )
