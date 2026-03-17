@@ -22,19 +22,18 @@ model_state = {}
 
 
 def load_latest_model():
-    """Find and load the most recently trained model from MODEL_DIR."""
-    pattern = os.path.join(MODEL_DIR, "xgb_*.pkl")
-    files = sorted(glob.glob(pattern))
-    if not files:
-        raise FileNotFoundError(f"No model files found in {MODEL_DIR}")
-    latest = files[-1]
-    with open(latest, "rb") as f:
+    """Load the champion model from MODEL_DIR."""
+    champion_path = os.path.join(MODEL_DIR, "champion.pkl")
+    if not os.path.exists(champion_path):
+        raise FileNotFoundError(f"No champion model found at {champion_path}")
+    with open(champion_path, "rb") as f:
         bundle = pickle.load(f)
     model_state["model"] = bundle["model"]
     model_state["encoder"] = bundle["encoder"]
     model_state["features"] = bundle["features"]
-    model_state["version"] = os.path.basename(latest).replace("xgb_", "").replace(".pkl", "")
-    logger.info(f"Loaded model version {model_state['version']}")
+    model_state["version"] = "champion"
+    model_state["algorithm"] = bundle.get("algorithm", "unknown")
+    logger.info(f"Loaded champion model. Algorithm: {model_state['algorithm']}")
 
 # -- Lifespan: load model at startup ------------
 @asynccontextmanager

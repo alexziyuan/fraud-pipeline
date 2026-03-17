@@ -19,11 +19,11 @@ MODEL_DIR = "/opt/airflow/data/models"
 CHUNK_SIZE = 50000
 
 def load_latest_model():
-    files = sorted(glob.glob(os.path.join(MODEL_DIR, "xgb_*.pkl")))
-    if not files:
-        raise FileNotFoundError("No model files found")
-    with open(files[-1], "rb") as f:
-        return pickle.load(f), os.path.basename(files[-1])
+    champion_path = os.path.join(MODEL_DIR, "champion.pkl")
+    if not os.path.exists(champion_path):
+        raise FileNotFoundError(f"No champion model at {champion_path}")
+    with open(champion_path, "rb") as f:
+        return pickle.load(f), "champion"
 
   
 def ensure_predictions_table(engine):
