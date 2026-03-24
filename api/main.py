@@ -65,6 +65,7 @@ class TransactionRequest(BaseModel):
 class PredictionResponse(BaseModel):
     fraud_probability: float
     is_fraud:          bool
+    threshold_used:    float
     model_version:     str
     scored_at:         str
 
@@ -101,23 +102,14 @@ def ensure_predictions_table():
 def build_features(req: TransactionRequest) -> pd.DataFrame:
     le = model_state["encoder"]
     features = model_state["features"]
-
     type_encoded = le.transform([req.type])[0]
 
     row = {
-        "type":                  type_encoded,
-        "amount":                req.amount,
-        "old_balance_orig":      req.old_balance_orig,
-        "new_balance_orig":      req.new_balance_orig,
-        "old_balance_dest":      req.old_balance_dest,
-        "new_balance_dest":      req.new_balance_dest,
-        "balance_diff_orig":     req.old_balance_orig - req.new_balance_orig,
-        "balance_diff_dest":     req.new_balance_dest - req.old_balance_dest,
-        "orig_zero_start":       int(req.old_balance_orig == 0),
-        "orig_zero_end":         int(req.new_balance_orig == 0),
-        "is_high_amount":        0,   # unknown without account history
-        "account_tx_count":      req.account_tx_count,
-        "account_cashout_count": req.account_cashout_count,
+        "type":             type_encoded,
+        "amount":           req.amount,
+        "balance_diff_orig": req.old_balance_orig - req.new_balance_orig,
+        "orig_zero_end":    int(req.new_balance_orig == 0),
+        "new_balance_dest": req.new_balance_dest,
     }
     return pd.DataFrame([row])[features]
 
@@ -145,7 +137,8 @@ def predict(transaction: TransactionRequest):
     try:
         X = build_features(transaction)
         proba = float(model_state["model"].predict_proba(X)[0][1])
-        is_fraud = proba >= 0.5
+        threshold = model_state.get('threshold', 0.5)
+        is_fraud = proba >= threshold
 
         # Persist prediction to DB
         engine = sqlalchemy.create_engine(DB_CONN)
@@ -175,6 +168,7 @@ def predict(transaction: TransactionRequest):
         return PredictionResponse(
             fraud_probability=round(proba,4),
             is_fraud=is_fraud,
+            threshold_used = threshold,
             model_version=model_state["version"],
             scored_at=datetime.utcnow().isoformat(),
         )

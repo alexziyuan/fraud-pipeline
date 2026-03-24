@@ -62,7 +62,7 @@ def batch_score(**context):
     query = """
         SELECT type, amount,
                old_balance_orig, new_balance_orig,
-               old_balance_dest, new_balance_dest
+               new_balance_dest
         FROM transactions_raw
         WHERE type IN ('TRANSFER', 'CASH_OUT')
         LIMIT 200000
@@ -73,12 +73,7 @@ def batch_score(**context):
         # Feature engineering mirrors v_features SQL view
         chunk["type"]              = encoder.transform(chunk["type"])
         chunk["balance_diff_orig"] = chunk["old_balance_orig"] - chunk["new_balance_orig"]
-        chunk["balance_diff_dest"] = chunk["new_balance_dest"] - chunk["old_balance_dest"]
-        chunk["orig_zero_start"]   = (chunk["old_balance_orig"] == 0).astype(int)
         chunk["orig_zero_end"]     = (chunk["new_balance_orig"] == 0).astype(int)
-        chunk["is_high_amount"]    = 0
-        chunk["account_tx_count"]  = 1
-        chunk["account_cashout_count"] = 0
 
         X     = chunk[features]
         proba = model.predict_proba(X)[:, 1]

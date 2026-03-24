@@ -24,10 +24,8 @@ default_args = {
 DB_CONN = 'postgresql+psycopg2://fraud_user:fraud_pass@postgres/fraud_db'
 MODEL_DIR = '/opt/airflow/data/models'
 FEATURE_COLS = [
-    'type', 'amount', 'old_balance_orig', 'new_balance_orig',
-    'old_balance_dest', 'new_balance_dest', 'balance_diff_orig',
-    'balance_diff_dest', 'orig_zero_start', 'orig_zero_end',
-    'is_high_amount', 'account_tx_count', 'account_cashout_count'
+    'balance_diff_orig', 'orig_zero_end', 'new_balance_dest',
+    'amount', 'type'
 ]
 TARGET_COL = 'is_fraud'
 
@@ -85,7 +83,41 @@ def compute_metrics(model, X_test, y_test):
         'f1':        round(f1_score(y_test, y_pred, zero_division=0), 4),
     }
 
-def log_model_run(engine, context, algorithm, metrics, model_path):
+
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+
+def run_cross_validation(model, X_train, y_train, cv_folds=5):
+    """
+    Run stratified k-fold CV and return mean/std of key metrics.
+    Uses the training set only -- test set is never touched during CV.
+    This prevents data leakage from the evaluation process.
+    """
+    cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+
+    auc_scores = cross_val_score(
+        model, X_train, y_train,
+        cv=cv, scoring='roc_auc', n_jobs=-1
+    )
+    f1_scores = cross_val_score(
+        model, X_train, y_train,
+        cv=cv, scoring='f1', n_jobs=-1
+    )
+    recall_scores = cross_val_score(
+        model, X_train, y_train,
+        cv=cv, scoring='recall', n_jobs=-1
+    )
+
+    return {
+        'cv_auc_mean':    round(float(auc_scores.mean()), 4),
+        'cv_auc_std':     round(float(auc_scores.std()), 4),
+        'cv_f1_mean':     round(float(f1_scores.mean()), 4),
+        'cv_f1_std':      round(float(f1_scores.std()), 4),
+        'cv_recall_mean': round(float(recall_scores.mean()), 4),
+        'cv_recall_std':  round(float(recall_scores.std()), 4),
+    } 
+
+
+def log_model_run(engine, context, algorithm, metrics, model_path, cv_results=None):
     """Write run metadata to model_runs table."""
     fraud_rate = context['ti'].xcom_pull(key='fraud_rate', task_ids='load_features')
     training_rows = context['ti'].xcom_pull(key='feature_shape', task_ids='load_features')[0]
@@ -93,13 +125,13 @@ def log_model_run(engine, context, algorithm, metrics, model_path):
     with engine.begin() as conn:
         conn.execute(sqlalchemy.text("""
             INSERT INTO model_runs
-            (run_id, model_version, training_rows, fraud_rate,
-            roc_auc, precision_score, recall_score, f1_score,
-            model_path, algorithm)
+                (run_id, model_version, training_rows, fraud_rate,
+                roc_auc, precision_score, recall_score, f1_score,
+                model_path, algorithm)
             VALUES
-            (:run_id, :version, :rows, :fraud_rate,
-             :roc_auc, :precision, :recall, :f1,
-             :path, :algorithm)
+                (:run_id, :version, :rows, :fraud_rate,
+                :roc_auc, :precision, :recall, :f1,
+                :path, :algorithm)
         """), {
             'run_id': context['run_id'],
             'version': os.path.basename(model_path).replace('.pkl', ''),
@@ -111,12 +143,32 @@ def log_model_run(engine, context, algorithm, metrics, model_path):
             'f1': metrics['f1'],
             'path': model_path,
             'algorithm': algorithm,
+            'cv_auc_mean':   cv_results['cv_auc_mean']    if cv_results else None,
+            'cv_auc_std':    cv_results['cv_auc_std']     if cv_results else None,
+            'cv_f1_mean':    cv_results['cv_f1_mean']     if cv_results else None,
+            'cv_recall_mean': cv_results['cv_recall_mean'] if cv_results else None,
         })
 
 
+from imblearn.pipeline import Pipeline as ImbPipeline
 def train_logreg(**context):
     X_train, X_test, y_train, y_test, le = prepare_data()
     engine = sqlalchemy.create_engine(DB_CONN)
+
+    # Cross-validate on training set for honest metric distribution
+    smote_pipeline = ImbPipeline([
+        ('smote', SMOTE(random_state=42)),
+        ('classifier', LogisticRegression(max_iter=1000, random_state=42, n_jobs=-1))
+    ])
+    cv_results = run_cross_validation(smote_pipeline, X_train, y_train)
+    logging.info(
+        f"CV ROC-AUC: {cv_results['cv_auc_mean']:.4f} "
+        f"+/- {cv_results['cv_auc_std']:.4f}"
+    )
+    logging.info(
+        f"CV Recall:  {cv_results['cv_recall_mean']:.4f} "
+        f"+/- {cv_results['cv_recall_std']:.4f}"
+    )
 
     # Apply SMOTE to training set only
     logging.info(f"Before SMOTE: fraud={y_train.sum()}, legit={(y_train == 0).sum()}")
@@ -135,13 +187,27 @@ def train_logreg(**context):
         pickle.dump({'model': model, 'encoder': le,
                      'features': FEATURE_COLS, 'algorithm': 'logreg'}, f)
 
-    log_model_run(engine, context, 'logreg', metrics, model_path)
     context['ti'].xcom_push(key='logreg_auc', value=metrics['roc_auc'])
+    log_model_run(engine, context, 'logreg', metrics, model_path, cv_results)
 
 
 def train_random_forest(**context):
     X_train, X_test, y_train, y_test, le = prepare_data()
     engine = sqlalchemy.create_engine(DB_CONN)
+
+    smote_pipeline = ImbPipeline([
+        ('smote', SMOTE(random_state=42)),
+        ('classifier', RandomForestClassifier(random_state=42, n_jobs=-1))
+    ])
+    cv_results = run_cross_validation(smote_pipeline, X_train, y_train)
+    logging.info(
+        f"CV ROC-AUC: {cv_results['cv_auc_mean']:.4f} "
+        f"+/- {cv_results['cv_auc_std']:.4f}"
+    )
+    logging.info(
+        f"CV Recall:  {cv_results['cv_recall_mean']:.4f} "
+        f"+/- {cv_results['cv_recall_std']:.4f}"
+    )
 
     sm = SMOTE(random_state=42)
     X_train_sm, y_train_sm = sm.fit_resample(X_train, y_train)
@@ -163,8 +229,8 @@ def train_random_forest(**context):
         pickle.dump({'model': model, 'encoder': le,
                      'features': FEATURE_COLS, 'algorithm': 'random_forest'}, f)
     
-    log_model_run(engine, context, 'random_forest', metrics, model_path)
     context['ti'].xcom_push(key='rf_auc', value=metrics['roc_auc'])
+    log_model_run(engine, context, 'random_forest', metrics, model_path, cv_results)
 
 def train_xgboost(**context):
     X_train, X_test, y_train, y_test, le = prepare_data()
@@ -182,19 +248,39 @@ def train_xgboost(**context):
         random_state=42,
         n_jobs=-1,
     )
+
+    # Cross-validate on training set for honest metric distribution
+    cv_results = run_cross_validation(model, X_train, y_train)
+    logging.info(
+        f"CV ROC-AUC: {cv_results['cv_auc_mean']:.4f} "
+        f"+/- {cv_results['cv_auc_std']:.4f}"
+    )
+    logging.info(
+        f"CV Recall:  {cv_results['cv_recall_mean']:.4f} "
+        f"+/- {cv_results['cv_recall_std']:.4f}"
+    )
+
     model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=50)
 
     metrics = compute_metrics(model, X_test, y_test)
     logging.info(f"XGBoost Metrics: {metrics}")
 
     model_path = f"{MODEL_DIR}/xgb_{context['run_id'][:8]}.pkl"
-    with open(model_path, 'wb') as f:
-        pickle.dump({'model': model, 'encoder': le,
-                     'features': FEATURE_COLS, 'algorithm': 'xgboost'}, f)
-        
-    log_model_run(engine, context, 'xgboost', metrics, model_path)
-    context['ti'].xcom_push(key='xgb_auc', value=metrics['roc_auc'])
     
+    OPTIMAL_THRESHOLD = 0.6484
+
+    with open(model_path, 'wb') as f:
+        pickle.dump({
+            'model':     model,
+            'encoder':   le,
+            'features':  FEATURE_COLS,
+            'algorithm': 'xgboost',
+            'threshold': OPTIMAL_THRESHOLD,
+        }, f)
+        
+    context['ti'].xcom_push(key='xgb_auc', value=metrics['roc_auc'])
+    log_model_run(engine, context, 'xgboost', metrics, model_path, cv_results)
+
 def compare_and_promote(**context):
     ti = context['ti']
     engine = sqlalchemy.create_engine(DB_CONN)
